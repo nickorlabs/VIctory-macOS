@@ -2141,6 +2141,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             let a = crate::resource::host_copy(object).unwrap();
             let b = crate::resource::host_copy(placed as This).unwrap();
+            // Sharing is optional when the host cannot create castable
+            // formats. Still verify the copy fallback and every output texel.
+            let shared = shared && a.castable.contains(&format);
             assert_eq!(std::sync::Arc::ptr_eq(&a, &b), shared, "round {round}: one host texture");
             let unordered = View::Unordered(object as usize, 0, Some([written, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
             slots.make(0, &unordered);
@@ -2266,7 +2269,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: inside the mapped buffers.
             let [depth_bits, stencil] = unsafe { (data.add((y * 64 + x) * 8) as *const [u32; 2]).read() };
             let got = f32::from_bits(depth_bits);
-            assert!((got - k as f32 / 65535.0).abs() < 1e-7, "depth at {x},{y}: {got}");
+            // Include the raw plane in a failure to distinguish a bad
+            // shader view from data lost during the depth/twin copy.
+            let raw_depth = unsafe {
+                (raw_data.add(f[0].Offset as usize + y * f[0].Footprint.RowPitch as usize + x * 4) as *const u32).read()
+            };
+            assert!((got - k as f32 / 65535.0).abs() < 1e-7,
+                "depth at {x},{y}: {got}; stencil {stencil}; raw plane {raw_depth:#010x}");
             assert_eq!(stencil, ((x ^ y) & 0xff) as u32, "stencil at {x},{y}");
             // SAFETY: inside the mapped buffer, by the footprints.
             let (word, byte) = unsafe {

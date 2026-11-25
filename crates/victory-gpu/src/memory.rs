@@ -616,13 +616,33 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Title memory (below 2^40, as the runtime places it): 1, 2 and
         // (from the second submission on) 1 page, write-watched as its pools.
         let pool = |pages: usize| -> usize {
-            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-            (0..256u64)
-                .map(|k| 0x40_0000_0000 + (k << 28))
-                // SAFETY: a fresh allocation where nothing is mapped, or none.
-                .map(|hint| unsafe { VirtualAlloc(hint as *const _, pages * PAGE, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
-                .find(|&p| p != 0)
-                .expect("memory below 2^40")
+            use windows_sys::Win32::System::Memory::{
+                MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
+                MemExtendedParameterAddressRequirements,
+                MEM_RESERVE, PAGE_READWRITE, VirtualAlloc2,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // Let the host choose within the title's full address range.
+            // A fixed high-address scan can miss every usable range under
+            // Wine/Rosetta even when constrained allocation is supported.
+            let mut range = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: 0x1_0000_0000usize as *mut _,
+                HighestEndingAddress: ((1usize << 40) - 1) as *mut _,
+                Alignment: 0,
+            };
+            let mut parameter = MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut range).cast();
+            // SAFETY: the range and parameter outlive the call; the result
+            // is a fresh write-watched allocation, released by this test.
+            let p = unsafe { VirtualAlloc2(
+                GetCurrentProcess(), std::ptr::null(), pages * PAGE,
+                MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH,
+                PAGE_READWRITE, &mut parameter, 1,
+            ) } as usize;
+            assert!(p >= 0x1_0000_0000 && p + pages * PAGE <= 1usize << 40,
+                "write-watched title allocation below 2^40: {p:#x}");
+            p
         };
         let memory = [pool(1), pool(2), pool(1)];
         let copy = |p: usize, pages: usize| {

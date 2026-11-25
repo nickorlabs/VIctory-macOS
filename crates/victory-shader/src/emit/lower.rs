@@ -2315,7 +2315,21 @@ impl<'a> Lower<'a> {
         // part is NaN. Metal's sin and cos give 0 there, so that NaN is
         // passed through here instead of relying on the host.
         let nan = self.s.m.cmp(c, pred::UNO, part, part);
-        self.s.m.select(c, nan, part, r)
+        let r = self.s.m.select(c, nan, part, r);
+        if cosine {
+            r
+        } else {
+            // Preserve a zero's sign as integer bits. A host sin or float
+            // select may canonicalize -0 under Metal's fast-math lowering.
+            let bits = self.as_int(x);
+            let mask = self.s.m.i32(0x7fff_ffff);
+            let magnitude = self.s.m.bin(c, Bin::And, bits, mask);
+            let zero = self.s.m.i32(0);
+            let is_zero = self.s.m.cmp(c, pred::EQ, magnitude, zero);
+            let result = self.as_int(r);
+            let result = self.s.m.select(c, is_zero, bits, result);
+            self.as_float(result)
+        }
     }
 
     /// The high dword of a 32 × 32-bit product.
@@ -7654,7 +7668,22 @@ impl<'a> Lower<'a> {
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
                 let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
-                return self.gather_at_level(inst, h, ss, &a, lod, guard);
+                return self.gather_at_level(inst, h, ss, &a, Some(lod), guard);
+            }
+            // For the supported black-border 2D sampler, use the same
+            // exact console footprint at level zero as at explicit levels.
+            // Native host gather rounding differs near texel boundaries
+            // (including D3DMetal and WARP), changing the returned texels.
+            if matches!(name, "image_gather4_lz" | "image_gather4_lz_o")
+                && !*a16 && !*d16 && !*unorm && kind == 2
+                && dmask.count_ones() == 1
+                && Self::exact_gather_sampler(ss)
+            {
+                let n = 2 + usize::from(name.ends_with("_o"));
+                let mut a = (0..n).map(|k| addr_val(self, k))
+                    .collect::<Result<Vec<_>, _>>()?;
+                a.push(self.s.m.i32(0));
+                return self.gather_at_level(inst, h, ss, &a, None, guard);
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
@@ -8037,6 +8066,17 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Conditions under which explicit texel loads reproduce the sampler.
+    fn exact_gather_sampler(sampler: &Source) -> bool {
+        let Source::Constant(w) = sampler else { return false };
+        let &[w0, w1, w2, w3, ..] = &w[..] else { return false };
+        w0 & 0x3f == 0x36
+            && w0 & (7 << 9 | 1 << 15 | 1 << 19 | 1 << 27 | 3 << 29) == 0
+            && w3 >> 30 == 0
+            && w2 & 0x000f_ffff == 0
+            && w1 & 0x0f_f0ff == 0
+    }
+
     /// `image_gather4_l(_o)`: DXIL gathers only from a view's first level,
     /// so the four texels are loaded from the level. Only what the title's
     /// culling shaders use: an immediate sampler without bias whose border
@@ -8050,7 +8090,7 @@ impl<'a> Lower<'a> {
         h: V,
         sampler: &Source,
         a: &[V],
-        lod: Value,
+        lod: Option<Value>,
         guard: Option<V>,
     ) -> Result<(), Why> {
         let Fields::Image { data, dmask, .. } = &inst.fields else {
@@ -8080,7 +8120,7 @@ impl<'a> Lower<'a> {
             return Err("a gather of several channels");
         }
         let mip_filter = bits(w2, 26, 2) != 0;
-        if mip_filter && self.whole(lod, &mut HashSet::new()) != Some(true) {
+        if mip_filter && lod.is_some_and(|lod| self.whole(lod, &mut HashSet::new()) != Some(true)) {
             return Err("a gather at a level that may not be whole");
         }
         let c = self.cur;

@@ -121,9 +121,18 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device
-                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
-                .cast()
+            // An empty Rust slice has a non-null dangling pointer. Some
+            // hosts interpret any non-null pointer as a serialized blob,
+            // even at length zero; use NULL for a new, empty library.
+            let data = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+            let mut raw = std::ptr::null_mut();
+            (device.vtable().CreatePipelineLibrary)(
+                device.as_raw(), data, bytes.len(), &ID3D12PipelineLibrary::IID, &mut raw,
+            ).ok()?;
+            if raw.is_null() {
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004003u32 as i32)));
+            }
+            ID3D12PipelineLibrary::from_raw(raw).cast()
         }
     };
     if !blob.is_empty() {
